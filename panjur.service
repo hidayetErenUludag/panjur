@@ -1,0 +1,14 @@
+[Unit]
+Description=Panjur shutter control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hidayeteren
+WorkingDirectory=/home/hidayeteren/panjur
+ExecStart=/home/hidayeteren/panjur-env/bin/python3 app.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
