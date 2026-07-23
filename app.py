@@ -1,25 +1,41 @@
 """
-Panjur control - TEST BUILD (relays are mocked, no hardware needed)
-===================================================================
-Web control for two roller shutters. Each shutter has TWO relays, wired
-in parallel with the wall switch's UP and DOWN buttons. A command holds
-the matching "button" for the configured time, then releases.
+Panjur control - TEST BUILD (relays/servos are mocked, no hardware needed)
+=========================================================================
+Web control for two roller shutters. Each shutter has TWO output channels,
+wired in parallel with the wall switch's UP and DOWN buttons. A command
+holds the matching "button" for the configured time, then releases.
 
 Run:            python3 app.py            -> http://erenpi.local:8000
 Quick demo:     HOLD_SECONDS=3 python3 app.py
 
-When the relay boards arrive, swap MockRelay for gpiozero in make_relay().
+AUTHENTICATION
+--------------
+Every page and API route requires login. Two secrets must be provided as
+environment variables (see gen_secrets.py and README):
 
-SECURITY NOTE: no authentication yet. Fine on your home LAN.
-Do NOT expose this via Cloudflare Tunnel / port forwarding until auth
-is added.
+    PANJUR_SECRET_KEY     - signs session cookies
+    PANJUR_PASSWORD_HASH  - scrypt hash of the login password
+
+These live in ~/.panjur.env, which is NOT in git. The app refuses to start
+without them, so it can never accidentally run unprotected.
 """
 
 import os
 import threading
 import time
+from datetime import timedelta
 
-from flask import Flask, abort, jsonify, render_template_string
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash
 
 # ----------------------------------------------------------------------------
 # Config - edit freely
@@ -32,36 +48,61 @@ SHUTTERS = [
     {"id": 2, "name": "Yatak Odası", "open_pin": 27, "close_pin": 23},
 ]
 
+# Login attempt throttling (per IP)
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 300
+SESSION_DAYS = 30
+
 # ----------------------------------------------------------------------------
-# Relay layer - the ONLY part that changes when hardware arrives
+# Secrets - refuse to start without them
 # ----------------------------------------------------------------------------
-class MockRelay:
-    """Pretends to be a relay. Prints to the console instead of switching."""
+SECRET_KEY = os.environ.get("PANJUR_SECRET_KEY", "")
+PASSWORD_HASH = os.environ.get("PANJUR_PASSWORD_HASH", "")
+
+if not SECRET_KEY or not PASSWORD_HASH:
+    raise SystemExit(
+        "\nERROR: PANJUR_SECRET_KEY and PANJUR_PASSWORD_HASH must be set.\n"
+        "Run:  python3 gen_secrets.py\n"
+        "and follow the instructions it prints.\n"
+    )
+
+# Set PANJUR_HTTPS=1 once the app is reachable only over HTTPS
+# (e.g. behind a Cloudflare Tunnel). Leave unset for plain-HTTP LAN use.
+HTTPS_ONLY = os.environ.get("PANJUR_HTTPS", "") == "1"
+
+# ----------------------------------------------------------------------------
+# Output layer - the ONLY part that changes when hardware arrives
+# ----------------------------------------------------------------------------
+class MockOutput:
+    """Pretends to be a relay/servo. Prints to the console instead."""
 
     def __init__(self, pin, label):
         self.pin = pin
         self.label = label
 
     def on(self):
-        print(f"[MOCK] GPIO{self.pin} ({self.label}): relay CLOSED (button held)")
+        print(f"[MOCK] GPIO{self.pin} ({self.label}): PRESSED  (button held)")
 
     def off(self):
-        print(f"[MOCK] GPIO{self.pin} ({self.label}): relay OPEN   (button released)")
+        print(f"[MOCK] GPIO{self.pin} ({self.label}): RELEASED (button free)")
 
 
-def make_relay(pin, label):
-    # --- REAL HARDWARE: delete the MockRelay line, uncomment the rest -------
-    return MockRelay(pin, label)
+def make_output(pin, label):
+    # --- REAL HARDWARE: delete the MockOutput line, uncomment one option ----
+    return MockOutput(pin, label)
+
+    # Option A - relay wired across the button contacts:
     # from gpiozero import OutputDevice
     # return OutputDevice(pin, active_high=False, initial_value=False)
-    # (most cheap relay boards are active-LOW: pin low = relay energised.
-    #  If yours clicks at the wrong moment, set active_high=True.)
+
+    # Option B - servo physically pressing the button (PCA9685 channel):
+    # see README; wrap a ServoKit channel in a class with on()/off()
 
 
-relays = {}
+outputs = {}
 for s in SHUTTERS:
-    relays[(s["id"], "open")] = make_relay(s["open_pin"], f"{s['name']} UP")
-    relays[(s["id"], "close")] = make_relay(s["close_pin"], f"{s['name']} DOWN")
+    outputs[(s["id"], "open")] = make_output(s["open_pin"], f"{s['name']} UP")
+    outputs[(s["id"], "close")] = make_output(s["close_pin"], f"{s['name']} DOWN")
 
 # ----------------------------------------------------------------------------
 # State machine: closed -> opening -> open -> closing -> closed
@@ -71,22 +112,119 @@ state = {s["id"]: {"status": "closed", "ends_at": None} for s in SHUTTERS}
 lock = threading.Lock()
 
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,      # JS cannot read the cookie
+    SESSION_COOKIE_SAMESITE="Lax",     # blocks cross-site form posts
+    SESSION_COOKIE_SECURE=HTTPS_ONLY,  # HTTPS-only once behind the tunnel
+    PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
+)
+
+# ----------------------------------------------------------------------------
+# Auth
+# ----------------------------------------------------------------------------
+attempts = {}  # ip -> {"count": int, "until": float}
+attempts_lock = threading.Lock()
+
+PUBLIC_ENDPOINTS = {"login", "api_login"}
 
 
+def client_ip():
+    return request.remote_addr or "unknown"
+
+
+def lockout_remaining(ip):
+    with attempts_lock:
+        rec = attempts.get(ip)
+        if not rec:
+            return 0
+        return max(0, int(rec["until"] - time.time()))
+
+
+def record_failure(ip):
+    with attempts_lock:
+        rec = attempts.setdefault(ip, {"count": 0, "until": 0})
+        rec["count"] += 1
+        if rec["count"] >= MAX_ATTEMPTS:
+            rec["until"] = time.time() + LOCKOUT_SECONDS
+            rec["count"] = 0
+            return True
+    return False
+
+
+def clear_failures(ip):
+    with attempts_lock:
+        attempts.pop(ip, None)
+
+
+@app.before_request
+def require_login():
+    """Single gate in front of everything. New routes are protected by
+    default, which is safer than remembering a decorator each time."""
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    if session.get("auth") is True:
+        return None
+    # Unauthenticated: JSON for the API, redirect for pages.
+    if request.path.startswith("/api/"):
+        return jsonify(ok=False, error="unauthorized"), 401
+    return redirect(url_for("login"))
+
+
+@app.get("/login")
+def login():
+    if session.get("auth") is True:
+        return redirect(url_for("index"))
+    return render_template_string(LOGIN_PAGE)
+
+
+@app.post("/api/login")
+def api_login():
+    ip = client_ip()
+    wait = lockout_remaining(ip)
+    if wait:
+        return jsonify(ok=False, error=f"cok fazla deneme, {wait}s bekleyin"), 429
+
+    password = (request.get_json(silent=True) or {}).get("password", "")
+    if password and check_password_hash(PASSWORD_HASH, password):
+        clear_failures(ip)
+        session.clear()
+        session["auth"] = True
+        session.permanent = True
+        print(f"[AUTH] login OK from {ip}")
+        return jsonify(ok=True)
+
+    locked = record_failure(ip)
+    print(f"[AUTH] login FAILED from {ip}{' - locked out' if locked else ''}")
+    time.sleep(1)  # slow down guessing
+    if locked:
+        return jsonify(ok=False, error=f"cok fazla deneme, {LOCKOUT_SECONDS}s bekleyin"), 429
+    return jsonify(ok=False, error="hatali parola"), 401
+
+
+@app.post("/api/logout")
+def api_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+# ----------------------------------------------------------------------------
+# Shutter control
+# ----------------------------------------------------------------------------
 def run_cycle(sid, direction):
     """Hold the UP or DOWN 'button' for the configured time, then release.
 
-    Interlock note: a shutter only enters this function from a non-busy
-    state (enforced under the lock in the API handlers), so its two
-    relays can never be energised at the same time.
+    A shutter only reaches this function from a non-busy state (enforced
+    under the lock in _start), so its two outputs can never be active
+    at the same time.
     """
     hold = HOLD_OPEN if direction == "open" else HOLD_CLOSE
-    relay = relays[(sid, direction)]
-    relay.on()
+    out = outputs[(sid, direction)]
+    out.on()
     try:
         time.sleep(hold)
     finally:
-        relay.off()  # always release, even if something goes wrong
+        out.off()  # always release, even if something goes wrong
     with lock:
         state[sid]["status"] = "open" if direction == "open" else "closed"
         state[sid]["ends_at"] = None
@@ -115,6 +253,7 @@ def api_move(sid, direction):
     ok, err = _start(sid, direction)
     if not ok:
         return jsonify(ok=False, error=err), 409
+    print(f"[CMD] {client_ip()} -> shutter {sid} {direction}")
     return jsonify(ok=True)
 
 
@@ -123,6 +262,7 @@ def api_move_all(direction):
     if direction not in ("open", "close"):
         abort(404)
     started = [s["id"] for s in SHUTTERS if _start(s["id"], direction)[0]]
+    print(f"[CMD] {client_ip()} -> all {direction} {started}")
     return jsonify(ok=True, started=started)
 
 
@@ -165,17 +305,9 @@ def index():
 
 
 # ----------------------------------------------------------------------------
-# Front-end (single page, no build step)
+# Shared styling
 # ----------------------------------------------------------------------------
-PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Panjur · erenpi</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
-<style>
+BASE_CSS = r"""
   :root{
     --housing:#1B1F26;      /* page: powder-coated shutter housing */
     --panel:#232933;
@@ -196,13 +328,120 @@ PAGE = r"""<!doctype html>
     min-height:100svh;display:flex;justify-content:center;
   }
   .wrap{width:min(430px,100%);padding:20px 16px 32px}
-
-  header{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
   h1{font-size:1.35rem;font-weight:700;letter-spacing:.14em;margin:0}
   .host{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-dim)}
+  :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+"""
+
+# ----------------------------------------------------------------------------
+# Login page
+# ----------------------------------------------------------------------------
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panjur &middot; giris</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+""" + BASE_CSS + r"""
+  body{align-items:center}
+  .wrap{padding-bottom:64px}
+  .brand{display:flex;align-items:baseline;gap:10px;justify-content:center;margin-bottom:22px}
+
+  /* a closed shutter as the login backdrop */
+  .gate{
+    height:96px;border-radius:12px 12px 0 0;border:1px solid var(--edge);
+    border-bottom:0;
+    background:repeating-linear-gradient(180deg,
+      var(--slat) 0 9px, var(--slat-shadow) 9px 11px);
+    position:relative;
+  }
+  .gate::before{
+    content:"";position:absolute;top:0;left:0;right:0;height:6px;background:#12151A;
+  }
+  .box{
+    background:var(--panel);border:1px solid var(--edge);border-top:4px solid #59616C;
+    border-radius:0 0 14px 14px;padding:18px 16px 20px;
+  }
+  label{display:block;font-size:.78rem;letter-spacing:.06em;color:var(--ink-dim);margin-bottom:7px}
+  input{
+    width:100%;padding:12px;border-radius:10px;border:1px solid var(--edge);
+    background:var(--housing);color:var(--ink);font:500 1rem "IBM Plex Mono",monospace;
+  }
+  button{
+    width:100%;margin-top:12px;padding:12px;border:0;border-radius:10px;
+    background:var(--amber);color:#1B1F26;
+    font:700 .9rem Archivo,sans-serif;letter-spacing:.05em;cursor:pointer;
+  }
+  button:disabled{background:#4A5260;color:#8B94A1;cursor:default}
+  .err{
+    margin-top:12px;min-height:1.1em;text-align:center;
+    font-family:"IBM Plex Mono",monospace;font-size:.75rem;color:var(--offline-red);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><h1>PANJUR</h1><span class="host">&middot; erenpi</span></div>
+  <div class="gate"></div>
+  <div class="box">
+    <label for="pw">PAROLA</label>
+    <input id="pw" type="password" autocomplete="current-password" autofocus>
+    <button id="go">GIRIS</button>
+    <div class="err" id="err"></div>
+  </div>
+</div>
+<script>
+const pw = document.getElementById("pw");
+const go = document.getElementById("go");
+const err = document.getElementById("err");
+
+async function submit(){
+  err.textContent = ""; go.disabled = true;
+  try{
+    const r = await fetch("/api/login", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({password: pw.value})
+    });
+    const d = await r.json();
+    if(d.ok){ window.location = "/"; return; }
+    err.textContent = d.error || "giris basarisiz";
+  }catch(e){
+    err.textContent = "baglanti hatasi";
+  }
+  pw.value = ""; pw.focus(); go.disabled = false;
+}
+go.addEventListener("click", submit);
+pw.addEventListener("keydown", e => { if(e.key === "Enter") submit(); });
+</script>
+</body>
+</html>"""
+
+
+# ----------------------------------------------------------------------------
+# Main page
+# ----------------------------------------------------------------------------
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panjur &middot; erenpi</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+""" + BASE_CSS + r"""
+  header{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--offline-red);
        margin-left:auto;align-self:center;transition:background .3s}
   .dot.live{background:var(--open-green)}
+  .out{
+    background:none;border:0;color:var(--ink-dim);cursor:pointer;
+    font:500 .68rem "IBM Plex Mono",monospace;letter-spacing:.08em;padding:0 0 0 4px;
+  }
 
   .all-row{display:flex;gap:8px;margin:12px 0 18px}
   .all-btn{
@@ -226,7 +465,6 @@ PAGE = r"""<!doctype html>
   .state.open{color:var(--open-green)}
   .state.moving{color:var(--amber)}
 
-  /* The window: dawn sky revealed as the shutter lifts */
   .window{
     position:relative;height:150px;border-radius:9px;overflow:hidden;
     border:1px solid var(--edge);
@@ -237,15 +475,14 @@ PAGE = r"""<!doctype html>
   .shutter{
     position:absolute;inset:0 0 auto 0;
     height:calc(var(--cover,1)*100%);
-    min-height:22px;                        /* rolled stack in the housing */
+    min-height:22px;
     background:repeating-linear-gradient(180deg,
       var(--slat) 0 9px, var(--slat-shadow) 9px 11px);
-    border-bottom:4px solid #59616C;        /* bottom rail */
+    border-bottom:4px solid #59616C;
     transition:height 1s linear;
   }
-  .shutter::before{                          /* housing lip */
-    content:"";position:absolute;top:0;left:0;right:0;height:6px;
-    background:#12151A;
+  .shutter::before{
+    content:"";position:absolute;top:0;left:0;right:0;height:6px;background:#12151A;
   }
   .count{
     position:absolute;right:8px;bottom:8px;
@@ -275,17 +512,15 @@ PAGE = r"""<!doctype html>
     margin-top:4px;text-align:center;
     font-family:"IBM Plex Mono",monospace;font-size:.66rem;color:var(--ink-dim);
   }
-  :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
-  @media (prefers-reduced-motion:reduce){
-    .shutter{transition:none}
-  }
+  @media (prefers-reduced-motion:reduce){ .shutter{transition:none} }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>PANJUR</h1><span class="host">· erenpi</span>
+    <h1>PANJUR</h1><span class="host">&middot; erenpi</span>
     <span class="dot" id="dot" title="connection"></span>
+    <button class="out" id="logout" title="cikis">CIKIS</button>
   </header>
 
   <div class="all-row">
@@ -312,7 +547,7 @@ PAGE = r"""<!doctype html>
   </article>
   {% endfor %}
 
-  <footer>test mode &mdash; relays simulated</footer>
+  <footer>test mode &mdash; outputs simulated</footer>
 </div>
 
 <script>
@@ -334,9 +569,16 @@ document.querySelectorAll(".card").forEach(el => {
 });
 document.getElementById("all-open").addEventListener("click",  () => act("move-all/open"));
 document.getElementById("all-close").addEventListener("click", () => act("move-all/close"));
+document.getElementById("logout").addEventListener("click", async () => {
+  try{ await fetch("/api/logout", {method:"POST"}); }catch(e){}
+  window.location = "/login";
+});
 
 async function act(path){
-  try{ await fetch("/api/" + path, {method:"POST"}); }catch(e){}
+  try{
+    const r = await fetch("/api/" + path, {method:"POST"});
+    if(r.status === 401){ window.location = "/login"; return; }
+  }catch(e){}
   poll();
 }
 
@@ -383,6 +625,7 @@ function render(data){
 async function poll(){
   try{
     const r = await fetch("/api/status");
+    if(r.status === 401){ window.location = "/login"; return; }
     render(await r.json());
     document.getElementById("dot").classList.add("live");
   }catch(e){
@@ -397,5 +640,6 @@ setInterval(poll, 1000);
 
 
 if __name__ == "__main__":
-    print(f"Panjur test server - hold open {HOLD_OPEN}s / close {HOLD_CLOSE}s, relays MOCKED")
+    print(f"Panjur test server - hold open {HOLD_OPEN}s / close {HOLD_CLOSE}s, outputs MOCKED")
+    print(f"Auth enabled. Secure cookies: {'on' if HTTPS_ONLY else 'off (LAN/HTTP)'}")
     app.run(host="0.0.0.0", port=8000)

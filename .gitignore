@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
-server.log
+*.log
 nohup.out
 .venv/
+.panjur.env
+*.env

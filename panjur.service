@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 User=hidayeteren
 WorkingDirectory=/home/hidayeteren/panjur
+EnvironmentFile=/home/hidayeteren/.panjur.env
 ExecStart=/home/hidayeteren/panjur-env/bin/gunicorn --workers 1 --threads 8 --bind 0.0.0.0:8000 --access-logfile - --error-logfile - app:app
 Restart=always
 RestartSec=3
