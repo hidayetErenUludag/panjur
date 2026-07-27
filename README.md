@@ -53,20 +53,54 @@ In `~/.panjur.env`:
   still on plain-HTTP LAN will make login silently fail, because the
   browser will refuse to send a Secure cookie over HTTP.
 
-## Going to real hardware
+## Going to real hardware (servos)
 
 The wall switch is mains-voltage (VIKO Karre jaluzi, 250V~), so the plan is
-servos physically pressing the buttons — no contact with mains wiring.
+four SG90 servos physically pressing the UP/DOWN buttons — no contact with
+mains wiring. Driven straight off Pi GPIO; no PCA9685 needed, because only
+one servo ever moves at a time (the interlock guarantees it) so peak current
+stays well within a 5V/3A supply.
 
-In `app.py`, `make_output()` is the only function that changes:
+### Wiring
 
-1. `~/panjur-env/bin/pip install adafruit-circuitpython-servokit`
-2. Wire PCA9685 to the Pi (SDA/SCL/3V3/GND), servos to channels 0-3,
-   separate 5V supply for the servo rail, grounds common.
-3. Replace `MockOutput` with a class whose `on()` sets the press angle and
-   `off()` returns to the rest angle, then delete the `return MockOutput(...)`.
+- Each servo signal (orange) -> one GPIO pin: 17, 22, 27, 23 (see SHUTTERS).
+- All servo power (red) -> a SEPARATE 5V/3A supply, NOT the Pi's 5V pin.
+  Servo inrush dips the rail; keeping it off the Pi's rail avoids the
+  brown-outs that corrupt the SD card.
+- All grounds common: servo supply GND + each servo brown + a Pi GND pin.
 
-Calibrate press/rest angles per servo before mounting the bracket.
+### Software
+
+```bash
+~/panjur-env/bin/pip install gpiozero
+# optional but recommended — steady jitter-free PWM:
+sudo apt install pigpio && sudo systemctl enable --now pigpiod
+```
+
+Switch the driver from mock to servo by adding one line to `~/.panjur.env`:
+
+```
+PANJUR_DRIVER='servo'
+```
+
+(Leave it as `mock`, or omit it, to keep running without hardware.)
+
+### Calibrate
+
+Every servo + bracket needs its own press/rest angles:
+
+```bash
+sudo systemctl stop panjur          # free the pins
+~/panjur-env/bin/python3 calibrate_servo.py
+sudo systemctl start panjur
+```
+
+It walks through all four servos and saves `~/.panjur.servos.json`
+(device-specific, gitignored). `app.py` reads it on start; servos with no
+saved entry fall back to the defaults in `SERVO_DEFAULT_REST/PRESS`.
+
+The servo detaches (stops driving) between moves, so it isn't buzzing or
+drawing current while idle — the plastic arm holds the light button fine.
 
 ## Notes / limitations
 

@@ -5,3 +5,4 @@ nohup.out
 .venv/
 .panjur.env
 *.env
+.panjur.servos.json

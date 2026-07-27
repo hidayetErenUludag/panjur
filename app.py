@@ -48,6 +48,15 @@ SHUTTERS = [
     {"id": 2, "name": "Yatak Odası", "open_pin": 27, "close_pin": 23},
 ]
 
+# Servo press/rest angles per GPIO pin. Every SG90 + bracket is slightly
+# different, so these get calibrated with calibrate_servo.py and saved to
+# ~/.panjur.servos.json. The values here are only fallback defaults used
+# if that file is missing. REST = servo backed off the button; PRESS =
+# button held down. They may be in either order (press could be a smaller
+# OR larger angle than rest, depending on how the arm is mounted).
+SERVO_DEFAULT_REST = 90
+SERVO_DEFAULT_PRESS = 60
+
 # Login attempt throttling (per IP)
 MAX_ATTEMPTS = 5
 LOCKOUT_SECONDS = 300
@@ -71,10 +80,22 @@ if not SECRET_KEY or not PASSWORD_HASH:
 HTTPS_ONLY = os.environ.get("PANJUR_HTTPS", "") == "1"
 
 # ----------------------------------------------------------------------------
-# Output layer - the ONLY part that changes when hardware arrives
+# Output layer
 # ----------------------------------------------------------------------------
+# Selects mock vs. real servo via the PANJUR_DRIVER env var:
+#   PANJUR_DRIVER=mock   (default) - console prints, no hardware
+#   PANJUR_DRIVER=servo            - drives SG90s on GPIO pins
+#
+# The web app, state machine and auth are identical either way. Only this
+# section touches hardware, so the mock remains fully testable off-Pi.
+import json
+
+DRIVER = os.environ.get("PANJUR_DRIVER", "mock").lower()
+SERVO_CAL_PATH = os.path.expanduser("~/.panjur.servos.json")
+
+
 class MockOutput:
-    """Pretends to be a relay/servo. Prints to the console instead."""
+    """Pretends to be a servo. Prints to the console instead of moving."""
 
     def __init__(self, pin, label):
         self.pin = pin
@@ -87,16 +108,72 @@ class MockOutput:
         print(f"[MOCK] GPIO{self.pin} ({self.label}): RELEASED (button free)")
 
 
+class ServoOutput:
+    """Drives one SG90 on a GPIO pin: on() presses the button, off() backs off.
+
+    Uses pigpio for the PWM if its daemon is running (rock-steady timing,
+    no jitter under CPU load), otherwise falls back to gpiozero's default
+    software PWM. Either way the servo is DETACHED between moves so it
+    isn't buzzing and drawing current while just holding position - the
+    plastic arm holds the light button fine without continuous drive.
+    """
+
+    def __init__(self, pin, label, rest, press):
+        self.pin = pin
+        self.label = label
+        self.rest = rest
+        self.press = press
+
+        from gpiozero import AngularServo
+
+        pin_factory = None
+        try:
+            from gpiozero.pins.pigpio import PiGPIOFactory
+            pin_factory = PiGPIOFactory()  # needs: sudo systemctl enable --now pigpiod
+        except Exception:
+            pin_factory = None  # software PWM fallback
+
+        # SG90 pulse range is ~0.5-2.4ms; the defaults gpiozero uses are
+        # narrower and won't reach the full 0-180 travel.
+        self.servo = AngularServo(
+            pin,
+            min_angle=0,
+            max_angle=180,
+            min_pulse_width=0.5 / 1000,
+            max_pulse_width=2.4 / 1000,
+            pin_factory=pin_factory,
+        )
+        self.servo.angle = None  # start detached (no buzzing)
+
+    def on(self):
+        self.servo.angle = self.press
+
+    def off(self):
+        self.servo.angle = self.rest
+        time.sleep(0.4)          # let it physically arrive before detaching
+        self.servo.angle = None  # detach: stop PWM, stop drawing current
+
+
+def _load_servo_cal():
+    """Read calibrated angles from ~/.panjur.servos.json if present.
+    Format: {"17": {"rest": 90, "press": 62}, "22": {...}, ...}"""
+    try:
+        with open(SERVO_CAL_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+_servo_cal = _load_servo_cal() if DRIVER == "servo" else {}
+
+
 def make_output(pin, label):
-    # --- REAL HARDWARE: delete the MockOutput line, uncomment one option ----
+    if DRIVER == "servo":
+        cal = _servo_cal.get(str(pin), {})
+        rest = cal.get("rest", SERVO_DEFAULT_REST)
+        press = cal.get("press", SERVO_DEFAULT_PRESS)
+        return ServoOutput(pin, label, rest, press)
     return MockOutput(pin, label)
-
-    # Option A - relay wired across the button contacts:
-    # from gpiozero import OutputDevice
-    # return OutputDevice(pin, active_high=False, initial_value=False)
-
-    # Option B - servo physically pressing the button (PCA9685 channel):
-    # see README; wrap a ServoKit channel in a class with on()/off()
 
 
 outputs = {}
@@ -640,6 +717,7 @@ setInterval(poll, 1000);
 
 
 if __name__ == "__main__":
-    print(f"Panjur test server - hold open {HOLD_OPEN}s / close {HOLD_CLOSE}s, outputs MOCKED")
+    print(f"Panjur test server - hold open {HOLD_OPEN}s / close {HOLD_CLOSE}s")
+    print(f"Driver: {DRIVER.upper()}")
     print(f"Auth enabled. Secure cookies: {'on' if HTTPS_ONLY else 'off (LAN/HTTP)'}")
     app.run(host="0.0.0.0", port=8000)
